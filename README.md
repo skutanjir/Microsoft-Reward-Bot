@@ -188,7 +188,7 @@ This platform is designed for personal use automation of Microsoft Rewards tasks
 
 ## License
 
-GPL-3.0-or-later
+[MIT License](./LICENSE)
 
 ## Credits
 
