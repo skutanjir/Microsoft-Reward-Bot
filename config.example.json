@@ -1,0 +1,154 @@
+{
+    "accounts": [
+        {
+            "email": "active1@outlook.com",
+            "password": "password123",
+            "enabled": false
+        },
+        {
+            "email": "active2@outlook.com",
+            "password": "password456",
+            "enabled": false
+        },
+        {
+            "email": "testing_account@outlook.com",
+            "password": "password789",
+            "enabled": false
+        },
+        {
+            "email": "example4@outlook.com",
+            "password": "pass",
+            "enabled": false
+        },
+        {
+            "email": "example5@outlook.com",
+            "password": "pass",
+            "enabled": false
+        },
+        {
+            "email": "example6@outlook.com",
+            "password": "pass",
+            "enabled": false
+        },
+        {
+            "email": "example7@outlook.com",
+            "password": "pass",
+            "enabled": false
+        },
+        {
+            "email": "example8@outlook.com",
+            "password": "pass",
+            "enabled": false
+        },
+        {
+            "email": "example9@outlook.com",
+            "password": "pass",
+            "enabled": false
+        },
+        {
+            "email": "example10@outlook.com",
+            "password": "pass",
+            "enabled": false
+        },
+        {
+            "email": "example11@outlook.com",
+            "password": "pass",
+            "enabled": false
+        },
+        {
+            "email": "example12@outlook.com",
+            "password": "pass",
+            "enabled": false
+        },
+        {
+            "email": "example13@outlook.com",
+            "password": "pass",
+            "enabled": false
+        },
+        {
+            "email": "example14@outlook.com",
+            "password": "pass",
+            "enabled": false
+        },
+        {
+            "email": "example15@outlook.com",
+            "password": "pass",
+            "enabled": true
+        },
+        {
+            "email": "example16@outlook.com",
+            "password": "pass",
+            "enabled": true
+        },
+        {
+            "email": "example17@outlook.com",
+            "password": "pass",
+            "enabled": true
+        },
+        {
+            "email": "example18@outlook.com",
+            "password": "pass",
+            "enabled": true
+        },
+        {
+            "email": "example19@outlook.com",
+            "password": "pass",
+            "enabled": true
+        },
+        {
+            "email": "example20@outlook.com",
+            "password": "pass",
+            "enabled": true
+        },
+        {
+            "email": "example...to...100@outlook.com",
+            "password": "pass",
+            "enabled": true
+        }
+    ],
+    "sessionPath": "./sessions",
+    "headless": true,
+    "clusters": 1,
+    "searchSettings": {
+        "desktopSearches": 34,
+        "mobileSearches": 20,
+        "searchOrder": "desktop-first",
+        "retryMobileSearchAmount": 2
+    },
+    "selectorLearning": {
+        "enabled": true,
+        "persistencePath": "./selectors.db",
+        "autoMutate": true,
+        "trainingMode": false,
+        "confidenceThreshold": 50
+    },
+    "antiDetection": {
+        "timingProfile": "normal",
+        "enableMouseMovement": true,
+        "enableScrollVariation": true,
+        "enableHoverBehavior": true
+    },
+    "recovery": {
+        "maxRetries": 3,
+        "enableAutoRecovery": true,
+        "fallbackToManual": false
+    },
+    "dashboard": {
+        "enabled": false,
+        "port": 3001,
+        "auth": {
+            "username": "admin",
+            "password": "change_me"
+        }
+    },
+    "webhooks": {
+        "enabled": false,
+        "discordWebhookUrl": ""
+    },
+    "baseURL": "https://rewards.bing.com",
+    "maxAccounts": 100,
+    "speedSettings": {
+        "minDelay": 5000,
+        "maxDelay": 15000
+    }
+}

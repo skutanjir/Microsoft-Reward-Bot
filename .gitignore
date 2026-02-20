@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.local
+
+# Configuration (contains credentials)
+accounts.json
+config.json
+
+# Sessions and state
+sessions/
+*.lock
+
+# Selector learning database
+selectors.db
+selectors.db-journal
+
+# Logs
+logs/
+*.log
+diagnostics/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+coverage/
+.nyc_output/
+
+# Playwright
+.playwright/
+playwright-report/
+test-results/
+
+# Temporary
+tmp/
+temp/
+*.tmp
