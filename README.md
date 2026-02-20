@@ -200,6 +200,8 @@ Rewritten from scratch with advanced selector intelligence, behavioral modeling,
 
 ---
 
-**Status**: Phase 1 Implementation (Foundations Complete)
+**Status**: 🚧 **BETA** - Phase 1 Implementation (Foundations Complete)
+
+**Note**: This project is still in active development (Beta). Some features may be unstable or subject to change.
 
 Next: Phase 2 - Browser & Anti-Detection Layer
