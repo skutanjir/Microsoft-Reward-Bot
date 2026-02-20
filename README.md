@@ -192,9 +192,9 @@ GPL-3.0-or-later
 
 ## Credits
 
-Built upon foundational work from:
-- **TheNetsky/microsoft-rewards-script**: Execution engine and anti-detection patterns
-- **LightZirconite/Microsoft-Rewards-Bot**: Dashboard visualization concepts
+This project builds upon the foundational work and concepts from:
+- **[TheNetsky/microsoft-rewards-script](https://github.com/TheNetsky/microsoft-rewards-script)**: Provided inspiration for the execution engine, search strategies, and baseline anti-detection patterns.
+- **[LightZirconite/Microsoft-Rewards-Bot](https://github.com/LightZirconite/Microsoft-Rewards-Bot)**: Provided inspiration for the overall architecture and dashboard visualization concepts.
 
 Rewritten from scratch with advanced selector intelligence, behavioral modeling, and production-grade architecture.
 
