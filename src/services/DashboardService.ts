@@ -334,10 +334,6 @@ export class DashboardService {
 
     /**
      * Expand all collapsed sections on the dashboard.
-     * Uses Playwright's click (not DOM click) to properly trigger React event handlers.
-     */
-    /**
-     * Expand all collapsed sections on the dashboard.
      * Uses a resilient re-scanning loop to handle DOM re-renders caused by React state updates.
      */
     async expandDashboardSections(page: Page, _data?: DashboardData): Promise<void> {
@@ -372,26 +368,43 @@ export class DashboardService {
                         'more activities', 'your perks', 'your progress',
                         'achievements', 'streak bonus', 'featured redemptions']
 
-                    // Find all potential toggle buttons
                     const allButtons = Array.from(document.querySelectorAll('button'))
 
                     for (const btn of allButtons) {
-                        // Skip if already expanded or has no expansion capability
-                        if (btn.getAttribute('aria-expanded') !== 'false') continue
-
-                        // HEURISTIC 1: Buttons with slot="trigger" are the gold standard for top-level sections
-                        const isTrigger = btn.getAttribute('slot') === 'trigger'
-
-                        // HEURISTIC 2: Buttons with chevrons/SVGs that look like toggles
+                        // Identify potential toggle buttons
+                        // Heuristic: slot="trigger", data-rac, or chevron-like small button
+                        const isTrigger = btn.getAttribute('slot') === 'trigger' || btn.hasAttribute('data-rac')
                         const hasSvg = btn.querySelector('svg') !== null
                         const isSmall = btn.offsetWidth < 70 && btn.offsetHeight < 70
+                        const isToggle = isTrigger || (hasSvg && isSmall) || btn.getAttribute('aria-label') === 'Daily set'
 
-                        if (isTrigger || (hasSvg && isSmall)) {
+                        if (isToggle) {
+                            // Check if it's already expanded
+                            const ariaExpanded = btn.getAttribute('aria-expanded')
+
+                            // If it says false, we definitely need to click it
+                            if (ariaExpanded === 'false') {
+                                // Keep going to known section check
+                            }
+                            // If it says true, check if it's actually expanded
+                            else if (ariaExpanded === 'true') {
+                                const controlsId = btn.getAttribute('aria-controls')
+                                const controlledEl = controlsId ? document.getElementById(controlsId) : null
+
+                                // If we can find the controlled element and it has 0 height, it's NOT truly expanded
+                                if (controlledEl && controlledEl.offsetHeight > 0) {
+                                    continue // Truly expanded, skip
+                                }
+                                // If no controlled element found, fallback to SVG rotation or just skip
+                            } else {
+                                // No aria-expanded attribute, but is a toggle candidate
+                            }
+
                             // Check if it's a known section header
                             let isKnownSection = false
                             let parent = btn.parentElement
                             for (let j = 0; j < 10 && parent; j++) {
-                                const text = parent.innerText?.toLowerCase() || ''
+                                const text = (parent as HTMLElement).innerText?.toLowerCase() || ''
                                 if (sections.some(s => text.includes(s))) {
                                     isKnownSection = true
                                     break
@@ -399,10 +412,8 @@ export class DashboardService {
                                 parent = parent.parentElement
                             }
 
-                            // If it's a trigger, or a known section small toggle, or just looks like a toggle
+                            // If it's a trigger, or a known section small toggle
                             if (isTrigger || isKnownSection) {
-                                // Return a unique enough identifier (id or innerText or unique path)
-                                // We use id if available, otherwise we'll fall back to a temporary marker
                                 if (!btn.id) {
                                     btn.id = `temp-expand-${Math.random().toString(36).substr(2, 9)}`
                                 }
@@ -420,7 +431,7 @@ export class DashboardService {
                     const sectionName = await page.$eval(selector, (btn) => {
                         let parent = btn.parentElement
                         for (let j = 0; j < 8 && parent; j++) {
-                            const text = parent.innerText?.toLowerCase() || ''
+                            const text = (parent as HTMLElement).innerText?.toLowerCase() || ''
                             const names = ['daily set', 'keep earning', 'more promotions', 'more activities', 'your perks', 'your progress', 'achievements']
                             for (const n of names) if (text.includes(n)) return n
                             parent = parent.parentElement
