@@ -3,16 +3,17 @@ import { SelectorResolver } from '../selectors/SelectorResolver'
 import { SectionHandler } from '../handlers/SectionHandler'
 import type { DiscoveredTask, UIContext } from '../types'
 import { Logger } from '../logging/Logger'
+import { UIService } from '../services/UIService'
 
 export class UIScanner {
     private logger: Logger
     private selectorResolver: SelectorResolver
     private sectionHandler: SectionHandler
 
-    constructor(logger: Logger, selectorResolver: SelectorResolver) {
+    constructor(logger: Logger, selectorResolver: SelectorResolver, uiService?: UIService) {
         this.logger = logger
         this.selectorResolver = selectorResolver
-        this.sectionHandler = new SectionHandler(logger, selectorResolver)
+        this.sectionHandler = new SectionHandler(logger, selectorResolver, uiService)
     }
 
     /**
@@ -65,16 +66,20 @@ export class UIScanner {
 
         const discoveredTasks: DiscoveredTask[] = []
 
-        // 2. Analyze each card
+        // 2. Analyze each card with internal retry logic for lazy-loaded items
         for (const card of cards) {
             try {
+                // Stronger validation: ensure card is not a "ghost" element
+                const box = await card.boundingBox()
+                if (!box || box.width === 0 || box.height === 0) continue
+
                 const task = await this.analyzeCard(page, card)
                 if (task) {
                     this.logger.debug('SCANNER', `Analyzed: ${task.title} (${task.points} pts) - Y: ${Math.round(task.y)} - Complete: ${task.isComplete}`)
                     discoveredTasks.push(task)
                 }
             } catch (error) {
-                this.logger.warn('SCANNER', 'Failed to analyze an activity card', { error: error instanceof Error ? error.message : String(error) })
+                this.logger.warn('SCANNER', 'Failed to analyze an activity card (skipping)', { error: error instanceof Error ? error.message : String(error) })
             }
         }
 

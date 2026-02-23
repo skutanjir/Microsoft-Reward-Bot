@@ -25,14 +25,15 @@ export class ActivityRunner {
         requestToken: string,
         cookies: Cookie[],
         fingerprint: BrowserFingerprintWithHeaders,
-        speedSettings?: { minDelay: number; maxDelay: number }
+        speedSettings?: { minDelay: number; maxDelay: number },
+        visualHandler?: VisualActivityHandler
     ) {
         this.logger = logger
         this.dashboardService = dashboardService
         this.requestToken = requestToken
         this.cookies = cookies
         this.fingerprint = fingerprint
-        this.visualHandler = new VisualActivityHandler(logger)
+        this.visualHandler = visualHandler || new VisualActivityHandler(logger)
         this.minDelay = speedSettings?.minDelay ?? 5000
         this.maxDelay = speedSettings?.maxDelay ?? 15000
     }
@@ -207,7 +208,7 @@ export class ActivityRunner {
                         // Poll detection: 10 points + pollscenarioid in URL
                         if (activity.pointProgressMax === 10 && activity.destinationUrl?.toLowerCase().includes('pollscenarioid')) {
                             this.logger.info('ACTIVITY', `Found "Poll" | title="${activity.title}" | offerId=${offerId} - Swapping to Visual Handler`)
-                            await this.visualHandler.execute(page, offerId, activity.title, activity.name)
+                            await this.visualHandler.execute(page, offerId, activity.title)
                             break
                         }
 
@@ -222,20 +223,21 @@ export class ActivityRunner {
                         if (name.includes('exploreonbing') || (activity.destinationUrl?.toLowerCase().includes('bing.com/search') && !activity.destinationUrl?.toLowerCase().includes('quiz'))) {
                             if (!this.requestToken) {
                                 this.logger.warn('ACTIVITY', `Token missing for "SearchOnBing" | title="${activity.title}" - trying Visual Handler fallback`)
-                                await this.visualHandler.execute(page, offerId, activity.title, activity.name)
+                                await this.visualHandler.execute(page, offerId, activity.title)
                                 break
                             }
 
                             this.logger.info('ACTIVITY', `Found "SearchOnBing" | title="${activity.title}" | offerId=${offerId}`)
                             const search = new ApiSearchOnBing(
                                 this.logger, this.dashboardService, this.requestToken,
-                                this.cookies, this.fingerprint
+                                this.cookies, this.fingerprint,
+                                { minDelay: this.minDelay, maxDelay: this.maxDelay }
                             )
                             await search.execute(activity, page)
                         } else {
                             if (!this.requestToken) {
                                 this.logger.warn('ACTIVITY', `Token missing for "UrlReward" | title="${activity.title}" - trying Visual Handler fallback`)
-                                await this.visualHandler.execute(page, offerId, activity.title, activity.name)
+                                await this.visualHandler.execute(page, offerId, activity.title)
                                 break
                             }
 
@@ -267,7 +269,7 @@ export class ActivityRunner {
                                 'ACTIVITY',
                                 `Unknown type "${activity.promotionType}" for "${activity.title}" | offerId=${offerId} — trying Visual Handler`
                             )
-                            await this.visualHandler.execute(page, offerId, activity.title, activity.name)
+                            await this.visualHandler.execute(page, offerId, activity.title)
                         } else {
                             this.logger.debug(
                                 'ACTIVITY',
@@ -343,6 +345,56 @@ export class ActivityRunner {
 
         // Navigate back to rewards dashboard
         await page.goto('https://rewards.bing.com/', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => { })
+    }
+
+    /**
+     * Verify points by navigating to the activity history page.
+     * This ensures the bot "checks" its work and registers points more reliably.
+     */
+    async doPointVerification(page: Page): Promise<void> {
+        this.logger.info('ACTIVITY-VERIFY', 'Starting point verification (Your Activity)...')
+        await this.dashboardService.navigateToActivity(page)
+        await page.waitForTimeout(2000)
+
+        const points = await page.evaluate(() => {
+            const el = document.querySelector('.totalPoints, .points-breakdown')
+            return el ? (el as HTMLElement).innerText : 'Hidden'
+        }).catch(() => 'Error')
+
+        this.logger.info('ACTIVITY-VERIFY', `Verification complete. Visible status: ${points}`)
+        await page.goto('https://rewards.bing.com/', { waitUntil: 'domcontentloaded' }).catch(() => { })
+    }
+
+    /**
+     * Handle the mobile-specific daily check-in.
+     */
+    async doMobileCheckIn(page: Page): Promise<void> {
+        this.logger.info('MOBILE-CHECKIN', 'Attempting daily mobile check-in...')
+        await this.dashboardService.navigateToCheckIn(page)
+        await page.waitForTimeout(3000)
+
+        // The check-in button is often behind a shadow root or dynamic
+        const clicked = await page.evaluate(() => {
+            const btn = Array.from(document.querySelectorAll('button, [role="button"]'))
+                .find(b => {
+                    const t = ((b as HTMLElement).innerText || '').toLowerCase()
+                    return t.includes('check') || t.includes('claim') || t.includes('tap')
+                })
+            if (btn) {
+                (btn as HTMLElement).click()
+                return true
+            }
+            return false
+        }).catch(() => false)
+
+        if (clicked) {
+            this.logger.info('MOBILE-CHECKIN', 'Check-in button clicked successfully')
+            await page.waitForTimeout(2000)
+        } else {
+            this.logger.debug('MOBILE-CHECKIN', 'No explicit check-in button found, may have already been claimed or is automatic')
+        }
+
+        await page.goto('https://rewards.bing.com/', { waitUntil: 'domcontentloaded' }).catch(() => { })
     }
 
     private wait(min: number, max: number): Promise<void> {

@@ -6,9 +6,14 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import path from 'path'
 
+import dotenv from 'dotenv'
+dotenv.config()
+
 import { ConfigManager } from './config/ConfigManager'
 import { Logger } from './logging/Logger'
 import { Utils } from './util/Utils'
+import { AiService } from './services/AiService'
+import { UIService } from './services/UIService'
 
 import type { ExecutionContext, Account, AccountStats } from './types'
 import { DashboardService } from './services/DashboardService'
@@ -176,9 +181,12 @@ class MicrosoftRewardsBot {
         const startTime = Date.now()
 
         // Create per-worker isolated instances
+        const aiService = new AiService(this.logger)
+        const uiService = new UIService(this.logger, aiService)
         const browserManager = new this.BrowserManagerClass(this.logger, this.utils)
         const sessionManager = new this.SessionManagerClass(this.logger, this.config.getConfig().sessionPath)
         const loginManager = new this.LoginManagerClass(this.logger, this.utils)
+        const visualHandler = new (require('./services/activities/VisualActivityHandler').VisualActivityHandler)(this.logger, aiService)
 
         try {
             // Desktop flow
@@ -191,7 +199,7 @@ class MicrosoftRewardsBot {
             }
 
             await executionContext.run(desktopContext, async () => {
-                await this.executeDesktopFlow(account, browserManager, sessionManager, loginManager, wId)
+                await this.executeDesktopFlow(account, browserManager, sessionManager, loginManager, visualHandler, uiService, wId)
             })
 
             // Mobile flow
@@ -204,7 +212,7 @@ class MicrosoftRewardsBot {
             }
 
             await executionContext.run(mobileContext, async () => {
-                await this.executeMobileFlow(account, browserManager, sessionManager, loginManager, wId)
+                await this.executeMobileFlow(account, browserManager, sessionManager, loginManager, visualHandler, uiService, wId)
             })
 
             accountStats.success = true
@@ -233,6 +241,8 @@ class MicrosoftRewardsBot {
         browserManager: any,
         sessionManager: any,
         loginManager: any,
+        visualHandler: any,
+        uiService: UIService,
         wId: string
     ): Promise<void> {
         this.logger.info(wId, `[DESKTOP] Starting desktop flow for ${account.email}`)
@@ -275,8 +285,8 @@ class MicrosoftRewardsBot {
             const cookies = await session.context.cookies()
             const fingerprint = session.fingerprint
 
-            // Initialize dashboard service and get token
-            const dashService = new DashboardService(this.logger)
+            // Initialize services
+            const dashService = new DashboardService(this.logger, uiService)
             const requestToken = await dashService.getRequestToken(page)
 
             if (!requestToken) {
@@ -293,7 +303,8 @@ class MicrosoftRewardsBot {
             // Run activities via API
             const runner = new ActivityRunner(
                 this.logger, dashService, requestToken ?? '',
-                cookies, fingerprint, this.config.getConfig().speedSettings
+                cookies, fingerprint, this.config.getConfig().speedSettings,
+                visualHandler
             )
 
             // Search Streak first (3 Bing searches)
@@ -311,6 +322,9 @@ class MicrosoftRewardsBot {
             const earned = finalPoints - currentPoints
 
             this.logger.info(wId, `[DESKTOP] Complete | dailySet=${dailySetCount} | morePromotions=${morePromoCount} | +${earned} pts | balance=${finalPoints}`)
+
+            // Final point verification as requested
+            await runner.doPointVerification(page)
 
             // Wait before closing
             await new Promise(r => setTimeout(r, 5000))
@@ -331,6 +345,8 @@ class MicrosoftRewardsBot {
         browserManager: any,
         sessionManager: any,
         loginManager: any,
+        visualHandler: any,
+        uiService: UIService,
         wId: string
     ): Promise<void> {
         this.logger.info(wId, `[MOBILE] Starting mobile flow for ${account.email}`)
@@ -374,7 +390,7 @@ class MicrosoftRewardsBot {
             const fingerprint = session.fingerprint
 
             // Initialize dashboard service and get token
-            const dashService = new DashboardService(this.logger)
+            const dashService = new DashboardService(this.logger, uiService)
             const requestToken = await dashService.getRequestToken(page)
 
             if (!requestToken) {
@@ -391,7 +407,8 @@ class MicrosoftRewardsBot {
             // Run activities via API
             const runner = new ActivityRunner(
                 this.logger, dashService, requestToken ?? '',
-                cookies, fingerprint, this.config.getConfig().speedSettings
+                cookies, fingerprint, this.config.getConfig().speedSettings,
+                visualHandler
             )
 
             // Search Streak first (3 Bing searches)
@@ -409,6 +426,12 @@ class MicrosoftRewardsBot {
             const earned = finalPoints - currentPoints
 
             this.logger.info(wId, `[MOBILE] Complete | dailySet=${dailySetCount} | morePromotions=${morePromoCount} | +${earned} pts | balance=${finalPoints}`)
+
+            // Mobile specific check-in
+            await runner.doMobileCheckIn(page)
+
+            // Final point verification
+            await runner.doPointVerification(page)
 
             // Wait before closing
             await new Promise(r => setTimeout(r, 3000))

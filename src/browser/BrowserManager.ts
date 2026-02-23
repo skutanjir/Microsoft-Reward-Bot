@@ -42,30 +42,64 @@ export class BrowserManager {
             '--disable-blink-features=AutomationControlled',
             '--disable-infobars',
             ...(!isMobile ? ['--start-maximized'] : []),
-            `--window-size=${windowSize}`
+            `--window-size=${windowSize}`,
+            '--lang=en-US,en'
         ]
 
-        try {
-            // Try launching with Chrome channel first (often more stable/trusted than pure Chromium)
-            this.logger.debug('BROWSER', 'Attempting to launch Google Chrome...')
-            this.browser = await chromium.launch({
-                headless: headless,
-                channel: 'chrome',
-                args: args
-            })
-            this.logger.info('BROWSER', 'Google Chrome launched successfully')
-        } catch (error) {
-            this.logger.warn('BROWSER', `Failed to launch Google Chrome, falling back to bundled Chromium. Error: ${error instanceof Error ? error.message : String(error)}`)
+        // 1. Try multiple browser channels for robustness
+        const channels = ['msedge', 'chrome']
 
-            // Fallback to bundled Chromium
+        for (const channel of channels) {
+            try {
+                this.logger.debug('BROWSER', `Attempting to launch browser with channel: ${channel}...`)
+                this.browser = await chromium.launch({
+                    headless: headless,
+                    channel: channel,
+                    args: args
+                })
+                this.logger.info('BROWSER', `${channel.charAt(0).toUpperCase() + channel.slice(1)} launched successfully`)
+                return this.browser
+            } catch (error) {
+                this.logger.warn('BROWSER', `Failed to launch with channel ${channel}: ${error instanceof Error ? error.message : String(error)}`)
+            }
+        }
+
+        // 2. Windows-specific Edge path fallback
+        if (process.platform === 'win32') {
+            const edgePaths = [
+                'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+                'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'
+            ]
+
+            for (const edgePath of edgePaths) {
+                try {
+                    this.logger.debug('BROWSER', `Attempting launch with explicit path: ${edgePath}`)
+                    this.browser = await chromium.launch({
+                        headless: headless,
+                        executablePath: edgePath,
+                        args: args
+                    })
+                    this.logger.info('BROWSER', 'Microsoft Edge launched via explicit path')
+                    return this.browser
+                } catch (error) {
+                    this.logger.warn('BROWSER', `Failed to launch via explicit path ${edgePath}: ${error instanceof Error ? error.message : String(error)}`)
+                }
+            }
+        }
+
+        // 3. Final fallback to bundled Chromium
+        try {
+            this.logger.debug('BROWSER', 'Falling back to bundled Chromium...')
             this.browser = await chromium.launch({
                 headless: headless,
                 args: args
             })
             this.logger.info('BROWSER', 'Bundled Chromium launched successfully')
+            return this.browser
+        } catch (error) {
+            this.logger.error('BROWSER', `CRITICAL: All browser launch attempts failed. Error: ${error instanceof Error ? error.message : String(error)}`)
+            throw new Error(`Failed to launch any browser distribution: ${error instanceof Error ? error.message : String(error)}`)
         }
-
-        return this.browser
     }
 
     /**
@@ -126,9 +160,9 @@ export class BrowserManager {
             permissions: ['geolocation', 'notifications'],
             extraHTTPHeaders: {
                 'Accept-Language': 'en-US,en;q=0.9',
-                // Client Hints headers — critical for mobile detection by Bing/Rewards
                 'sec-ch-ua-mobile': isMobile ? '?1' : '?0',
                 'sec-ch-ua-platform': isMobile ? '"Android"' : '"Windows"',
+                ...(account.proxy ? {} : { 'X-Forwarded-For': '1.1.1.1' })
             },
             proxy: account.proxy ? {
                 server: `${account.proxy.protocol}://${account.proxy.host}:${account.proxy.port}`,

@@ -17,13 +17,17 @@ interface TaskInfo {
     isPromo: boolean
 }
 
+import { UIService } from '../services/UIService'
+
 export class SectionHandler {
     private logger: Logger
     private selectorResolver: SelectorResolver
+    private uiService?: UIService
 
-    constructor(logger: Logger, selectorResolver: SelectorResolver) {
+    constructor(logger: Logger, selectorResolver: SelectorResolver, uiService?: UIService) {
         this.logger = logger
         this.selectorResolver = selectorResolver
+        this.uiService = uiService
     }
 
     /**
@@ -293,8 +297,20 @@ export class SectionHandler {
         }).then(h => h.asElement());
 
         if (!disclosure) {
-            this.logger.debug('SECTION', `No disclosure control found via structure for ${sectionKey}, trying aria-label fallback`)
+            this.logger.debug('SECTION', `No disclosure control found via structure for ${sectionKey}, trying UIService fallback`)
             const ariaLabel = sectionKey.replace(/_container/g, '').replace(/_/g, ' ')
+
+            if (this.uiService) {
+                const result = await this.uiService.discoverElement(page, {
+                    text: [ariaLabel, 'See more'],
+                    role: 'toggle',
+                    aiGoal: `Find the expansion toggle for the ${ariaLabel} section.`
+                })
+                if (result.element) {
+                    return await this.performExpansion(page, result.element, sectionKey)
+                }
+            }
+
             const fallbackBtn = await page.$(`button[aria-label*="${ariaLabel}" i], [aria-label*="${ariaLabel}" i][role="button"]`)
             if (fallbackBtn) {
                 return await this.performExpansion(page, fallbackBtn, sectionKey)

@@ -16,19 +16,24 @@ export class ApiSearchOnBing {
     private requestToken: string
     private cookies: Cookie[]
     private fingerprint: BrowserFingerprintWithHeaders
+    private minDelay: number
+    private maxDelay: number
 
     constructor(
         logger: Logger,
         dashboardService: DashboardService,
         requestToken: string,
         cookies: Cookie[],
-        fingerprint: BrowserFingerprintWithHeaders
+        fingerprint: BrowserFingerprintWithHeaders,
+        speedSettings?: { minDelay: number; maxDelay: number }
     ) {
         this.logger = logger
         this.dashboardService = dashboardService
         this.requestToken = requestToken
         this.cookies = cookies
         this.fingerprint = fingerprint
+        this.minDelay = speedSettings?.minDelay ?? 5000
+        this.maxDelay = speedSettings?.maxDelay ?? 15000
     }
 
     async execute(promotion: BasePromotion, page: Page): Promise<void> {
@@ -129,7 +134,8 @@ export class ApiSearchOnBing {
                 await page.keyboard.type(query, { delay: 50 })
                 await page.keyboard.press('Enter')
 
-                await this.wait(5000, 7000)
+                // Wait for the dynamic minDelay to maxDelay
+                await this.wait(this.minDelay, this.maxDelay)
 
                 // Check for point updates
                 const newBalance = await this.dashboardService.getCurrentPoints(this.cookies, this.fingerprint).catch(() => oldBalance)
@@ -147,7 +153,8 @@ export class ApiSearchOnBing {
                     `Error during search | query="${query}" | ${error instanceof Error ? error.message : String(error)}`
                 )
             } finally {
-                await this.wait(5000, 15000)
+                // Wait after search before doing the next one
+                await this.wait(this.minDelay, this.maxDelay)
                 await page.goto('https://rewards.bing.com/', { timeout: 5000 }).catch(() => { })
             }
         }

@@ -1,143 +1,147 @@
 
 import type { Page } from 'patchright'
 import { Logger } from '../../logging/Logger'
+import { AiService } from '../AiService'
 
 export class VisualActivityHandler {
     private logger: Logger
+    private aiService?: AiService
 
-    constructor(logger: Logger) {
+    constructor(logger: Logger, aiService?: AiService) {
         this.logger = logger
+        this.aiService = aiService
     }
 
     /**
      * visually click a dashboard card based on its offerId.
      * This is a fallback for when API methods fail or for unsupported types like Polls.
      */
-    async execute(page: Page, offerId: string, title: string, activityName?: string): Promise<boolean> {
-        this.logger.info('VISUAL-ACTIVITY', `Attempting visual click for "${title}" (offerId=${offerId}) on URL: ${page.url()}`)
+    async execute(page: Page, offerId: string, title: string): Promise<boolean> {
+        this.logger.info('VISUAL-ACTIVITY', `Attempting visual activity execution for "${title}" (offerId=${offerId})`)
 
         try {
-            // Diagnostic: Take a screenshot if we fail
-            const takeScreenshot = async (screenshotName: string) => {
-                const path = `./logs/visual_fail_${screenshotName}_${Date.now()}.png`
-                await page.screenshot({ path }).catch(() => { })
-                this.logger.debug('VISUAL-ACTIVITY', `Screenshot saved to: ${path}`)
-            }
+            // Setup listener for new tabs (common for Rewards activities)
+            const pagePromise = page.context().waitForEvent('page', { timeout: 8000 }).catch(() => null)
 
-            // Build selector list — supports both old UI (pointLink) and new UI (data attributes)
-            const name = activityName?.toLowerCase() ?? ''
-
+            // Strategy 1: Standard Playwright selectors (fastest)
+            let clicked = false
             const selectors = [
-                // === Old UI selectors (TheNetsky pattern) ===
-                // :not(.contentContainer .pointLink) avoids clicking nested content links
                 `[data-bi-id^="${offerId}"] .pointLink:not(.contentContainer .pointLink)`,
                 `[data-bi-id="${offerId}"] .pointLink:not(.contentContainer .pointLink)`,
-                // Name-based selectors for special activities (membercenter, exploreonbing)
-                ...(name ? [`[data-bi-id^="${name}"] .pointLink:not(.contentContainer .pointLink)`] : []),
-                // Broader old UI fallbacks
                 `[data-bi-id^="${offerId}"] .pointLink`,
                 `a[data-bi-id^="${offerId}"]`,
-                // === New UI selectors ===
                 `div[data-offer-id="${offerId}"]`,
                 `a[href*="${offerId}"]`,
                 `div[class*="promotional-item"] a[href*="${offerId}"]`,
-                // === Text-based fallbacks (last resort) ===
-                `button:has-text("${title}")`,
                 `a:has-text("${title}")`,
                 `[aria-label*="${title}"]`,
                 `[title*="${title}"]`
             ]
 
-            let targetElement = null
             for (const selector of selectors) {
                 try {
                     const el = page.locator(selector).first()
                     if (await el.count() > 0) {
-                        targetElement = el
-                        this.logger.debug('VISUAL-ACTIVITY', `Found element with selector: ${selector}`)
+                        this.logger.debug('VISUAL-ACTIVITY', `Found element via selector: ${selector}`)
+                        await el.scrollIntoViewIfNeeded({ timeout: 1000 }).catch(() => { })
+                        await el.click({ force: true, timeout: 2000 }).catch(() => { })
+                        clicked = true
                         break
                     }
-                } catch { }
+                } catch { /* try next */ }
             }
 
-            if (!targetElement) {
-                this.logger.warn('VISUAL-ACTIVITY', `Could not find element for "${title}" (offerId=${offerId}). Checking page for similar patterns...`)
-                await takeScreenshot(offerId)
+            // Strategy 2: Aggressive DOM-wide search
+            if (!clicked) {
+                this.logger.debug('VISUAL-ACTIVITY', 'Standard selectors failed. Starting aggressive DOM scan...')
+                clicked = await page.evaluate(({ id, t }) => {
+                    function findMatchingElement(root: Node): HTMLElement | null {
+                        const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)
+                        let node = walker.nextNode() as HTMLElement | null
 
-                // Diagnostic: Check for all elements, piercing Shadow DOM
-                const diagnosticInfo = await page.evaluate(() => {
-                    const results: any[] = []
-                    const scan = (root: any, depth: number) => {
-                        if (!root || !root.querySelectorAll || depth > 5) return
+                        while (node) {
+                            const href = String((node as any).href || '')
+                            const text = (node.innerText || node.textContent || '').toLowerCase()
+                            const ariaLabel = node.getAttribute('aria-label')?.toLowerCase() || ''
+                            const dataId = node.getAttribute('data-bi-id') || node.getAttribute('data-offer-id') || ''
 
-                        // Look for all links and potential interactive elements
-                        const elements = root.querySelectorAll('a, button, [data-offer-id], [data-bi-id], [class*="promotional"]')
-                        elements.forEach((el: any) => {
-                            const attrs: any = {}
-                            for (const attr of el.attributes) {
-                                if (attr.name.startsWith('data-') || attr.name === 'href' || attr.name === 'class') {
-                                    attrs[attr.name] = attr.value.substring(0, 50)
+                            if (dataId.includes(id) || href.includes(id) || text.includes(t.toLowerCase()) || ariaLabel.includes(t.toLowerCase())) {
+                                if (node.tagName === 'A' || node.tagName === 'BUTTON' || node.onclick || node.getAttribute('role') === 'button') {
+                                    return node
                                 }
                             }
-                            results.push({
-                                tag: el.tagName,
-                                text: el.textContent?.substring(0, 30).trim(),
-                                attrs
-                            })
-                        })
 
-                        // Recursive Shadow DOM scan
-                        root.querySelectorAll('*').forEach((el: any) => {
-                            if (el.shadowRoot) scan(el.shadowRoot, depth + 1)
-                        })
+                            if (node.shadowRoot) {
+                                const found = findMatchingElement(node.shadowRoot)
+                                if (found) return found
+                            }
+                            node = walker.nextNode() as HTMLElement | null
+                        }
+                        return null
                     }
 
-                    scan(document, 0)
-                    return results.slice(0, 50)
-                })
-                this.logger.debug('VISUAL-ACTIVITY', `Extensive DOM Scan: ${JSON.stringify(diagnosticInfo)}`)
-
-                return false
+                    const target = findMatchingElement(document.body)
+                    if (target) {
+                        target.scrollIntoView()
+                        target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }))
+                        target.click()
+                        return true
+                    }
+                    return false
+                }, { id: offerId, t: title })
             }
 
-            // Click handling - anticipate a new tab opening
-            this.logger.info('VISUAL-ACTIVITY', `Clicking "${title}"...`)
+            // Strategy 3: Section-based fallback
+            if (!clicked) {
+                const sectionSelector = title.toLowerCase().includes('daily') ? 'section#dailyset' : 'section'
+                this.logger.debug('VISUAL-ACTIVITY', `Falling back to section-based search (${sectionSelector})...`)
 
-            // Interaction: scroll, hover, then click
-            await targetElement.scrollIntoViewIfNeeded()
-            await page.waitForTimeout(500)
-            await targetElement.hover().catch(() => { })
+                clicked = await page.evaluate(({ sel, t }) => {
+                    const section = document.querySelector(sel)
+                    if (!section) return false
+                    const links = Array.from(section.querySelectorAll('a, [role="button"]'))
+                    const match = links.find(l => ((l as HTMLElement).innerText || l.textContent || '').toLowerCase().includes(t.toLowerCase()))
+                    if (match) {
+                        (match as HTMLElement).click()
+                        return true
+                    }
+                    if (sel.includes('dailyset')) {
+                        const firstLink = section.querySelector('a')
+                        if (firstLink) {
+                            (firstLink as HTMLElement).click()
+                            return true
+                        }
+                    }
+                    return false
+                }, { sel: sectionSelector, t: title })
+            }
 
-            const [newPage] = await Promise.all([
-                page.context().waitForEvent('page', { timeout: 10000 }).catch(() => null),
-                targetElement.click({ force: true }).catch(async () => {
-                    this.logger.debug('VISUAL-ACTIVITY', 'Standard click failed, trying dispatchEvent("click")')
-                    await targetElement.evaluate(el => el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })))
-                })
-            ])
+            if (clicked) {
+                const newPage = await pagePromise
+                if (newPage) {
+                    this.logger.info('VISUAL-ACTIVITY', 'Activity tab opened, waiting for load...')
+                    await newPage.waitForLoadState('domcontentloaded').catch(() => { })
+                    await page.waitForTimeout(5000) // Wait for reward to register
 
-            if (newPage) {
-                this.logger.info('VISUAL-ACTIVITY', 'New tab opened, waiting for load...')
-                await newPage.waitForLoadState('domcontentloaded').catch(() => { })
-                await newPage.waitForTimeout(8000) // Increased wait for "counting"
+                    if (title.toLowerCase().includes('poll') || title.toLowerCase().includes('quiz')) {
+                        await this.handlePoll(newPage)
+                    }
 
-                // If it's a poll, we might need to click an answer
-                if (title.toLowerCase().includes('poll') || title.toLowerCase().includes('quiz')) {
-                    this.logger.info('VISUAL-ACTIVITY', 'Poll/Quiz detected in tab, checking for options...')
-                    await this.handlePoll(newPage)
+                    await newPage.close().catch(() => { })
+                    this.logger.info('VISUAL-ACTIVITY', 'Closed activity tab')
+                } else {
+                    this.logger.debug('VISUAL-ACTIVITY', 'No new tab detected, assuming inline or background click.')
+                    await page.waitForTimeout(2000)
                 }
-
-                await newPage.close().catch(() => { })
-                this.logger.info('VISUAL-ACTIVITY', 'Closed activity tab')
-                return true
-            } else {
-                this.logger.info('VISUAL-ACTIVITY', 'No new tab detected (might be inline or failed)')
-                await page.waitForTimeout(2000)
                 return true
             }
+
+            // Failure
+            this.logger.warn('VISUAL-ACTIVITY', `All visual strategies failed for "${title}"`)
+            return false
 
         } catch (error) {
-            this.logger.error('VISUAL-ACTIVITY', `Error performing visual click: ${error instanceof Error ? error.message : String(error)}`)
+            this.logger.error('VISUAL-ACTIVITY', `Error in visual execution: ${error instanceof Error ? error.message : String(error)}`)
             return false
         }
     }
@@ -161,8 +165,27 @@ export class VisualActivityHandler {
                     return
                 }
             }
-        } catch (e) {
+
+            // AI Fallback for Polls
+            if (this.aiService) {
+                this.logger.debug('VISUAL-ACTIVITY', 'Poll automation failed, trying AI fallback...')
+                const pageText = await page.evaluate(() => document.body.innerText.substring(0, 3000))
+                const aiResult = await this.aiService.findElement(pageText, 'Find the first available option in this poll and provide a CSS selector to click it.')
+
+                if (aiResult?.selector && aiResult.confidence > 0.6) {
+                    this.logger.info('VISUAL-ACTIVITY', `AI suggested poll selector: ${aiResult.selector}`)
+                    try {
+                        await page.click(aiResult.selector, { timeout: 5000, force: true })
+                        return
+                    } catch (err) {
+                        this.logger.warn('VISUAL-ACTIVITY', `AI recommended poll selector failed: ${aiResult.selector}`)
+                    }
+                }
+            }
+
             this.logger.warn('VISUAL-ACTIVITY', 'Failed to interact with poll options')
+        } catch (e) {
+            this.logger.warn('VISUAL-ACTIVITY', `Error in poll handler: ${e instanceof Error ? e.message : String(e)}`)
         }
     }
 }
