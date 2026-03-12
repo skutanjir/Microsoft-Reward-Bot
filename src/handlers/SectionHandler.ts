@@ -1,407 +1,487 @@
 /**
  * Section Handler
- * Manages discovery and interaction with UI sections (Streaks, Quests, Keep earning)
+ * Manages discovery and clicking of task cards in MS Rewards sections.
+ *
+ * TASK CLICK STRATEGY CASCADE:
+ *  S1. Playwright locator by exact href
+ *  S2. Playwright locator filter by title text
+ *  S3. getByRole('link') with accessible name
+ *  S4. DOM evaluate + full MouseEvent dispatch (bypasses pointer-events, React handlers)
+ *  S5. Keyboard TAB+ENTER navigation to the card
+ *
+ * EXPAND STRATEGY CASCADE:
+ *  S1. Direct CSS on button[slot="trigger"][aria-expanded="false"]
+ *  S2. Already-expanded pre-check (skip if open)
+ *  S3. page.locator filter by section name text
+ *  S4. SelectorResolver bank + evaluateHandle
+ *  S5. TAB keyboard navigation
  */
 
 import type { Page } from 'patchright'
 import { SelectorResolver } from '../selectors/SelectorResolver'
 import { Logger } from '../logging/Logger'
 import type { UIContext } from '../types'
+import { UIService } from '../services/UIService'
 
 interface TaskInfo {
     title: string
     href: string
+    hrefPath: string
     points: string
     isCompleted: boolean
     isReferral: boolean
     isPromo: boolean
 }
 
-import { UIService } from '../services/UIService'
-
 export class SectionHandler {
     private logger: Logger
     private selectorResolver: SelectorResolver
-    private uiService?: UIService
 
-    constructor(logger: Logger, selectorResolver: SelectorResolver, uiService?: UIService) {
+    constructor(logger: Logger, selectorResolver: SelectorResolver, _uiService?: UIService) {
         this.logger = logger
         this.selectorResolver = selectorResolver
-        this.uiService = uiService
     }
 
-    /**
-     * Expand section and execute tasks using direct DOM detection.
-     * Scans all <a> task cards, filters completed/referral/promo, clicks uncompleted ones.
-     */
+    // ══════════════════════════════════════════════════════════════════════════
+    // PUBLIC: EXPAND + EXECUTE TASKS
+    // ══════════════════════════════════════════════════════════════════════════
+
     async expandAndExecuteTasks(page: Page, sectionKey: string, uiContext: UIContext): Promise<number> {
-        this.logger.info('SECTION', `Expanding and executing tasks for: ${sectionKey}`)
+        this.logger.info('SECTION', `Processing section: ${sectionKey}`)
 
-        // First, try to find and expand the section
-        const titleElement = await this.selectorResolver.resolveElement(page, sectionKey, uiContext, 1500)
+        await this.expandSection(page, sectionKey, uiContext)
+        await new Promise(r => setTimeout(r, 1000))
 
-        if (!titleElement) {
-            this.logger.warn('SECTION', `Section ${sectionKey} not found, skipping`)
-            return 0
-        }
+        await page.evaluate(() => window.scrollBy(0, 400)).catch(() => { })
+        await new Promise(r => setTimeout(r, 600))
 
-        // Try to expand if collapsed
-        const expanded = await this.expandSection(page, sectionKey, uiContext)
-        if (expanded) {
-            this.logger.info('SECTION', `Section ${sectionKey} was collapsed, now expanded`)
-            await new Promise(r => setTimeout(r, 1000))
-        } else {
-            this.logger.info('SECTION', `Section ${sectionKey} already expanded or no expansion needed`)
-        }
+        const taskInfos = await this.discoverTasks(page, sectionKey)
+        this.logger.info('SECTION', `Found ${taskInfos.length} cards in ${sectionKey}`)
 
-        // Scroll down to reveal all tasks
-        await page.evaluate(() => window.scrollBy(0, 300))
-        await new Promise(r => setTimeout(r, 500))
+        const clickable = taskInfos.filter(t => !t.isCompleted && !t.isReferral && !t.isPromo)
+        this.logger.info('SECTION', `${clickable.length} uncompleted | ${taskInfos.length - clickable.length} skipped`)
 
-        // ===== Direct DOM-based task detection =====
-        // Scan all <a> task cards in the section, detect points & completion status,
-        // filter out referrals/promos, and click uncompleted tasks directly.
-        this.logger.info('SECTION', `Scanning tasks in ${sectionKey} via DOM...`)
         let tasksExecuted = 0
 
-        // Discover all clickable task links in this section
-        const taskInfos = await this.discoverTasks(page, sectionKey)
-        this.logger.info('SECTION', `Found ${taskInfos.length} total cards in ${sectionKey}`)
+        for (const task of clickable) {
+            this.logger.info('SECTION', `▶ Clicking: "${task.title}" (+${task.points} pts)`)
 
-        // Filter to uncompleted, non-referral, non-promo tasks
-        const clickableTasks = taskInfos.filter(t => !t.isCompleted && !t.isReferral && !t.isPromo)
-        this.logger.info('SECTION', `${clickableTasks.length} uncompleted tasks to execute (skipped ${taskInfos.length - clickableTasks.length} completed/referral/promo)`)
+            const success = await this.clickTask(page, task)
 
-        for (const task of clickableTasks) {
-            this.logger.info('SECTION', `Clicking task: "${task.title}" (${task.points} pts) - ${task.href}`)
-
-            // Click the task link directly
-            const [newPage] = await Promise.all([
-                page.context().waitForEvent('page', { timeout: 10000 }).catch(() => null),
-                page.locator(`a[href="${task.href}"]`).first().click({ timeout: 5000 }).catch(async () => {
-                    // Fallback: try clicking by text
-                    this.logger.debug('SECTION', `href selector failed, trying text click for "${task.title}"`)
-                    await page.locator(`a:has-text("${task.title}")`).first().click({ timeout: 5000 }).catch(() => {
-                        this.logger.warn('SECTION', `Could not click task: "${task.title}"`)
-                    })
-                })
-            ])
-
-            // Add random delay to appear human
-            await new Promise(r => setTimeout(r, 500 + Math.floor(Math.random() * 500)))
-
-            if (newPage) {
-                this.logger.debug('SECTION', `Task opened new tab, waiting for load...`)
-                await newPage.waitForLoadState('domcontentloaded').catch(() => { })
-                await new Promise(r => setTimeout(r, 3000))
-                await newPage.close().catch(() => { })
+            if (success) {
                 tasksExecuted++
-
-                // Re-expand section after returning
-                this.logger.debug('SECTION', `Returned to rewards page, re-expanding ${sectionKey}...`)
-                await this.expandSection(page, sectionKey, uiContext)
-                await new Promise(r => setTimeout(r, 500))
+                this.logger.info('SECTION', `✓ Completed: "${task.title}"`)
             } else {
-                // Check if navigated away in the same tab
-                const currentUrl = page.url()
-                const isRewardsPage = currentUrl.includes('/earn') || currentUrl.includes('/dashboard') || currentUrl.includes('/rewards')
+                this.logger.warn('SECTION', `✗ Failed: "${task.title}"`)
+            }
 
-                if (!isRewardsPage) {
-                    this.logger.info('SECTION', `Same-tab navigation to ${currentUrl}, going back`)
-                    await page.goBack().catch(() => page.goto(uiContext.pageUrl))
-                    await new Promise(r => setTimeout(r, 2000))
-                    await this.expandSection(page, sectionKey, uiContext)
-                    tasksExecuted++
-                } else {
-                    // Task may have opened a modal or stayed on page
-                    await new Promise(r => setTimeout(r, 2000))
-                    await this.expandSection(page, sectionKey, uiContext)
-                    tasksExecuted++
-                }
+            await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random() * 400)))
+            await this.expandSection(page, sectionKey, uiContext)
+            await new Promise(r => setTimeout(r, 500))
+        }
+
+        this.logger.info('SECTION', `${sectionKey}: executed ${tasksExecuted}/${clickable.length}`)
+        return tasksExecuted
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PUBLIC: EXPAND ALL
+    // ══════════════════════════════════════════════════════════════════════════
+
+    async expandAllSections(page: Page, uiContext: UIContext): Promise<boolean> {
+        this.logger.info('SECTION', 'Expanding all reward sections...')
+        let expandedAny = false
+
+        for (const sectionKey of ['daily_set_container', 'streaks_container', 'keep_earning_container']) {
+            try {
+                if (await this.expandSection(page, sectionKey, uiContext)) expandedAny = true
+            } catch (error) {
+                this.logger.warn('SECTION', `Failed to expand ${sectionKey}: ${error instanceof Error ? error.message : String(error)}`)
             }
         }
 
-        this.logger.info('SECTION', `Completed ${tasksExecuted} tasks in ${sectionKey}`)
-
-        return tasksExecuted
+        return expandedAny
     }
-    /**
-     * Discover all task cards in a section by querying the DOM directly.
-     * Returns info about each card: title, href, points, completion status, referral/promo flags.
-     */
-    private async discoverTasks(page: Page, sectionKey: string): Promise<TaskInfo[]> {
-        // Find the section container - it's the parent disclosure panel
-        // The section key maps to a heading, and the tasks are in the sibling content area
-        const tasks = await page.evaluate((secKey) => {
-            const results: Array<{
-                title: string
-                href: string
-                points: string
-                isCompleted: boolean
-                isReferral: boolean
-                isPromo: boolean
-            }> = []
 
-            // Determine which section's disclosure panel we're in
-            // Look for the section heading text to identify the container
+    // ══════════════════════════════════════════════════════════════════════════
+    // TASK DISCOVERY
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private async discoverTasks(page: Page, sectionKey: string): Promise<TaskInfo[]> {
+        const raw = await page.evaluate((secKey) => {
             const sectionNames: Record<string, string[]> = {
                 'daily_set_container': ['daily set'],
                 'keep_earning_container': ['keep earning', 'more activities'],
-                'streaks_container': ['streaks']
+                'streaks_container': ['streaks'],
             }
 
-            const targetNames = sectionNames[secKey] || []
+            const targetNames = sectionNames[secKey] ?? []
 
-            // Find the section's disclosure group
+            // Find the section's Disclosure container
             let sectionContainer: Element | null = null
-            const disclosures = Array.from(document.querySelectorAll('.react-aria-Disclosure, [class*="Disclosure"]'))
-
+            const disclosures = Array.from(
+                document.querySelectorAll<Element>('.react-aria-Disclosure, [class*="Disclosure"], section')
+            )
             for (const disc of disclosures) {
                 const heading = disc.querySelector('h2, h3, [slot="trigger"]')
-                const headingText = heading?.textContent?.toLowerCase() || ''
-                if (targetNames.some(name => headingText.includes(name))) {
+                if (targetNames.some(n => (heading?.textContent ?? '').toLowerCase().includes(n))) {
                     sectionContainer = disc
                     break
                 }
             }
 
-            // If we found the section container, only look at links inside it
-            // Otherwise, check all links on the page (fallback)
-            const searchScope = sectionContainer || document
-            const links = Array.from(searchScope.querySelectorAll('a[data-react-aria-pressable="true"]'))
+            const scope = sectionContainer ?? document
+
+            // Priority selector list for card links
+            const prioritySelectors = [
+                'a[data-react-aria-pressable="true"]',
+                'a[href][class*="card"]',
+                'a[href][class*="task"]',
+                'a[href][class*="offer"]',
+                'a[href*="rewards.bing.com"]',
+                'a[href*="bing.com/search"]',
+                'a[href*="bing.com"]',
+                'a[href]',
+            ]
+
+            let links: HTMLAnchorElement[] = []
+            for (const sel of prioritySelectors) {
+                const found = Array.from(scope.querySelectorAll<HTMLAnchorElement>(sel))
+                    .filter(a => a.href && a.href !== window.location.href && !a.href.endsWith('#'))
+                if (found.length > 0) {
+                    links = found
+                    break
+                }
+            }
+
+            const results: Array<{
+                title: string; href: string; hrefPath: string; points: string
+                isCompleted: boolean; isReferral: boolean; isPromo: boolean
+            }> = []
 
             for (const link of links) {
-                const href = (link as HTMLAnchorElement).href || ''
-                const text = link.textContent || ''
+                const href = link.href ?? ''
+                const text = (link.textContent ?? '').trim()
                 const textLower = text.toLowerCase()
 
-                // Get the title from the first <p> with text-body1Strong class
-                const titleEl = link.querySelector('.text-body1Strong, p.line-clamp-3')
-                const title = titleEl?.textContent?.trim() || text.substring(0, 60).trim()
+                if (!href || href === window.location.href) continue
 
-                // Check completion: look for bg-statusSuccessBg3 (green check) + "Completed" text
-                const hasCompletedBadge = link.querySelector('.bg-statusSuccessBg3') !== null
-                const hasCompletedText = textLower.includes('completed')
-                const isCompleted = hasCompletedBadge && hasCompletedText
+                // Title extraction
+                const titleEl =
+                    link.querySelector('.text-body1Strong') ??
+                    link.querySelector('p.line-clamp-3') ??
+                    link.querySelector('[class*="title"]') ??
+                    link.querySelector('p') ??
+                    link.querySelector('h2, h3, h4')
+                const title = (titleEl?.textContent ?? text).trim().substring(0, 80)
+                if (!title || title.length < 2) continue
 
-                // Check referral
-                const isReferral = href.toLowerCase().includes('/refer') ||
+                // Completion
+                const hasGreenBadge = link.querySelector('.bg-statusSuccessBg3') !== null
+                const hasCheckmark = link.querySelector('[class*="checkmark"]') !== null ||
+                    link.querySelector('[class*="complete"]') !== null
+                const hasCompletedTx = textLower.includes('completed')
+                const isCompleted = (hasGreenBadge || hasCheckmark) && hasCompletedTx
+
+                // Referral
+                const isReferral =
+                    href.toLowerCase().includes('/refer') ||
                     textLower.includes('refer and earn') ||
                     textLower.includes('turn referrals into rewards') ||
-                    textLower.includes('true friends use bing together') ||
-                    textLower.includes('turn referrals into rewards')
+                    textLower.includes('true friends use bing together')
 
-                // Check promo
-                const isPromo = textLower.includes('see your new dashboard') ||
-                    textLower.includes('see what\'s new') ||
+                // Promo noise
+                const isPromo =
+                    textLower.includes('see your new dashboard') ||
+                    textLower.includes("see what's new") ||
                     textLower.includes('love at first click')
 
-                // Extract points from +N badge
+                // Points
                 let points = '0'
-                const pointsBadge = link.querySelector('p.text-caption1Stronger')
+                const pointsBadge =
+                    link.querySelector('p.text-caption1Stronger') ??
+                    link.querySelector('[class*="points"]')
                 if (pointsBadge) {
-                    const pointsText = pointsBadge.textContent || ''
-                    const match = pointsText.match(/\+?(\d+)/)
-                    if (match) points = match[1]
+                    const m = (pointsBadge.textContent ?? '').match(/\+?(\d+)/)
+                    if (m) points = m[1]
                 }
 
-                results.push({
-                    title,
-                    href,
-                    points,
-                    isCompleted,
-                    isReferral,
-                    isPromo
-                })
+                // Relative path for alternate locator
+                let hrefPath = href
+                try { hrefPath = new URL(href).pathname + new URL(href).search } catch { /* keep */ }
+
+                results.push({ title, href, hrefPath, points, isCompleted, isReferral, isPromo })
             }
 
             return results
         }, sectionKey)
 
-        // Log each discovered task
-        for (const task of tasks) {
-            const status = task.isCompleted ? '✅' : task.isReferral ? '🔗' : task.isPromo ? '📢' : '🎯'
-            this.logger.debug('SECTION', `  ${status} "${task.title}" - ${task.points}pts - completed:${task.isCompleted} - referral:${task.isReferral} - promo:${task.isPromo}`)
-        }
-
-        return tasks
-    }
-
-    /**
-     * Ensure all relevant rewards sections are expanded.
-     * Returns true if any section was expanded.
-     */
-    async expandAllSections(page: Page, uiContext: UIContext): Promise<boolean> {
-        this.logger.info('SECTION', 'Ensuring rewards sections are expanded...')
-        let expandedAny = false
-
-        const sections = ['daily_set_container', 'streaks_container', 'keep_earning_container']
-
-        for (const sectionKey of sections) {
-            try {
-                const result = await this.expandSection(page, sectionKey, uiContext)
-                if (result) expandedAny = true
-            } catch (error) {
-                this.logger.warn('SECTION', `Failed to expand section: ${sectionKey}`, { error: error instanceof Error ? error.message : String(error) })
-            }
-        }
-        return expandedAny
-    }
-
-    /**
-     * Expand a specific section if it's collapsed.
-     * Returns true if a click was performed.
-     */
-    private async expandSection(page: Page, sectionKey: string, uiContext: UIContext): Promise<boolean> {
-        this.logger.debug('SECTION', `Attempting to expand section: ${sectionKey}`)
-        const titleElement = await this.selectorResolver.resolveElement(page, sectionKey, uiContext, 1500)
-
-        if (!titleElement) {
-            this.logger.debug('SECTION', `Section title not found: ${sectionKey}`)
-            return false
-        }
-
-        // The disclosure button is usually a sibling or nearby.
-        // We evaluate on the page to find the associated button robustly.
-        const disclosure = await titleElement.evaluateHandle((node) => {
-            const el = node as Element;
-
-            // 1. Find the nearest container that likely holds the disclosure logic
-            const container = el.closest('section, .react-aria-Disclosure, div[class*="Disclosure"], div[class*="section"]');
-            if (container) {
-                // Look for the toggle button within this container
-                const btn = container.querySelector('button[aria-expanded], [role="button"][aria-expanded]') ||
-                    container.querySelector('button[aria-label*="more" i], button[aria-label*="expand" i]') ||
-                    Array.from(container.querySelectorAll('button')).find(b => b.textContent?.toLowerCase().includes('see more'));
-                if (btn) return btn;
-            }
-
-            // 1.5. Check if the element itself contains a "See more" button
-            const seeMoreBtn = el.querySelector('button[aria-label*="more" i]') ||
-                Array.from(el.querySelectorAll('button')).find(b => b.textContent?.toLowerCase().includes('see more'));
-            if (seeMoreBtn) return seeMoreBtn;
-
-            // 2. Check siblings
-            let sibling = el.nextElementSibling;
-            while (sibling) {
-                if (sibling.getAttribute('aria-expanded') || sibling.querySelector('[aria-expanded]')) {
-                    return sibling.getAttribute('aria-expanded') ? sibling : sibling.querySelector('[aria-expanded]');
-                }
-                sibling = sibling.nextElementSibling;
-            }
-
-            // 3. Check el itself
-            if (el.getAttribute('aria-expanded')) return el;
-
-            return null;
-        }).then(h => h.asElement());
-
-        if (!disclosure) {
-            this.logger.debug('SECTION', `No disclosure control found via structure for ${sectionKey}, trying UIService fallback`)
-            const ariaLabel = sectionKey.replace(/_container/g, '').replace(/_/g, ' ')
-
-            if (this.uiService) {
-                const result = await this.uiService.discoverElement(page, {
-                    text: [ariaLabel, 'See more'],
-                    role: 'toggle',
-                    aiGoal: `Find the expansion toggle for the ${ariaLabel} section.`
-                })
-                if (result.element) {
-                    return await this.performExpansion(page, result.element, sectionKey)
-                }
-            }
-
-            const fallbackBtn = await page.$(`button[aria-label*="${ariaLabel}" i], [aria-label*="${ariaLabel}" i][role="button"]`)
-            if (fallbackBtn) {
-                return await this.performExpansion(page, fallbackBtn, sectionKey)
-            }
-            return false
-        }
-
-        return await this.performExpansion(page, disclosure, sectionKey)
-    }
-
-    private async performExpansion(page: Page, disclosure: any, sectionKey: string): Promise<boolean> {
-        let ariaExpanded = await disclosure.getAttribute('aria-expanded')
-        // If no aria-expanded, check children
-        if (ariaExpanded === null) {
-            ariaExpanded = await disclosure.$eval('[aria-expanded]', (el: any) => el.getAttribute('aria-expanded')).catch(() => null)
-        }
-
-        const isExpanded = ariaExpanded === 'true'
-        this.logger.debug('SECTION', `Section ${sectionKey} aria-expanded: ${ariaExpanded}`)
-
-        if (!isExpanded) {
-            this.logger.info('SECTION', `Expanding section: ${sectionKey} using keyboard navigation (TAB + ENTER)`)
-
-            // Scroll the button into view first (but don't click)
-            await disclosure.scrollIntoViewIfNeeded().catch(() => { })
-
-            // Get the aria-label to identify when we've focused the right button
-            const targetLabel = await disclosure.getAttribute('aria-label').catch(() => sectionKey)
-
-            this.logger.debug('SECTION', `Navigating to button with label: ${targetLabel}`)
-
-            // Focus on the page body first
-            await page.evaluate(() => {
-                document.body.focus()
-            })
-
-            // Press TAB multiple times until we focus the target button
-            let focused = false
-            for (let i = 0; i < 50; i++) {
-                await page.keyboard.press('Tab')
-                await new Promise(r => setTimeout(r, 100))
-
-                // Check if we've focused the right element
-                const currentFocus = await page.evaluate(() => {
-                    const el = document.activeElement
-                    return {
-                        tag: el?.tagName,
-                        ariaLabel: el?.getAttribute('aria-label'),
-                        ariaExpanded: el?.getAttribute('aria-expanded'),
-                        slot: el?.getAttribute('slot')
-                    }
-                })
-
-                this.logger.debug('SECTION', `TAB ${i + 1}: Focused ${currentFocus.tag} [aria-label="${currentFocus.ariaLabel}"] [aria-expanded="${currentFocus.ariaExpanded}"] [slot="${currentFocus.slot}"]`)
-
-                // Extract section name from sectionKey (e.g., "daily_set_container" -> "daily set")
-                const sectionName = sectionKey.replace('_container', '').replace(/_/g, ' ')
-
-                // Check if this is our target button - ALL conditions must be true:
-                // 1. aria-expanded="false" (collapsed)
-                // 2. slot="trigger" (React Aria disclosure)
-                // 3. aria-label contains section name
-                const isTargetButton = currentFocus.ariaExpanded === 'false' &&
-                    currentFocus.slot === 'trigger' &&
-                    currentFocus.ariaLabel?.toLowerCase().includes(sectionName.toLowerCase())
-
-                if (isTargetButton) {
-                    focused = true
-                    this.logger.info('SECTION', `Found target button after ${i + 1} TABs - "${currentFocus.ariaLabel}"`)
-                    break
-                }
-            }
-
-            if (!focused) {
-                this.logger.warn('SECTION', `Could not focus on ${sectionKey} button via TAB navigation`)
-                return false
-            }
-
-            // Press ENTER to expand
-            this.logger.debug('SECTION', `Pressing ENTER to expand ${sectionKey}`)
-            await page.keyboard.press('Enter')
-            await new Promise(r => setTimeout(r, 3000)) // Wait for animation and lazy loading
-
-            // Verify expansion
-            const newExpanded = await disclosure.getAttribute('aria-expanded').catch(() => null)
-            this.logger.debug('SECTION', `Expansion check for ${sectionKey}: became ${newExpanded}`)
-
+        // Deduplicate by href
+        const seen = new Set<string>()
+        const deduped = raw.filter(t => {
+            if (seen.has(t.href)) return false
+            seen.add(t.href)
             return true
+        })
+
+        for (const t of deduped) {
+            const icon = t.isCompleted ? '✅' : t.isReferral ? '🔗' : t.isPromo ? '📢' : '🎯'
+            this.logger.debug('SECTION', `  ${icon} "${t.title}" +${t.points}pts`)
+        }
+
+        return deduped
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // CLICK TASK — 5-strategy cascade
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private async clickTask(page: Page, task: TaskInfo): Promise<boolean> {
+        const newPagePromise = page.context()
+            .waitForEvent('page', { timeout: 12000 })
+            .catch(() => null)
+
+        const clicked = await this.tryClickStrategies(page, task)
+        if (!clicked) return false
+
+        await this.handlePostClick(page, newPagePromise, task)
+        return true
+    }
+
+    private async tryClickStrategies(page: Page, task: TaskInfo): Promise<boolean> {
+        const { href, hrefPath, title } = task
+
+        // ── S1: Exact href locator ──────────────────────────────────────────
+        for (const hrefVal of [href, hrefPath]) {
+            try {
+                const loc = page.locator(`a[href="${hrefVal}"]`).first()
+                if (await loc.count() > 0 && await loc.isVisible().catch(() => false)) {
+                    this.logger.debug('SECTION', `S1 href click: ${hrefVal.substring(0, 60)}`)
+                    await loc.scrollIntoViewIfNeeded().catch(() => { })
+                    await loc.click({ force: true, timeout: 5000 })
+                    return true
+                }
+            } catch { /* next */ }
+        }
+
+        // ── S2: Locator filter by title text ───────────────────────────────
+        try {
+            const loc = page.locator('a[href]').filter({ hasText: title }).first()
+            if (await loc.count() > 0 && await loc.isVisible().catch(() => false)) {
+                this.logger.debug('SECTION', `S2 text filter click: "${title}"`)
+                await loc.scrollIntoViewIfNeeded().catch(() => { })
+                await loc.click({ force: true, timeout: 5000 })
+                return true
+            }
+        } catch { /* next */ }
+
+        // ── S3: getByRole link with accessible name ────────────────────────
+        try {
+            const loc = page.getByRole('link', { name: title, exact: false }).first()
+            if (await loc.count() > 0 && await loc.isVisible().catch(() => false)) {
+                this.logger.debug('SECTION', `S3 getByRole link: "${title}"`)
+                await loc.scrollIntoViewIfNeeded().catch(() => { })
+                await loc.click({ force: true, timeout: 5000 })
+                return true
+            }
+        } catch { /* next */ }
+
+        // ── S4: DOM evaluate + full MouseEvent dispatch ────────────────────
+        const domResult = await page.evaluate(({ h, t }) => {
+            // Find by href first
+            let el: HTMLElement | null = document.querySelector<HTMLAnchorElement>(`a[href="${h}"]`)
+
+            // Fallback: text scan
+            if (!el) {
+                el = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]')).find(a =>
+                    (a.textContent ?? '').trim().toLowerCase().includes(t.toLowerCase()) ||
+                    (a.getAttribute('aria-label') ?? '').toLowerCase().includes(t.toLowerCase())
+                ) ?? null
+            }
+
+            if (!el) return false
+
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+            // Fire full mouse event sequence — required for React synthetic events
+            for (const type of ['mouseenter', 'mouseover', 'mousedown', 'mouseup']) {
+                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }))
+            }
+            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }))
+            el.click()
+            return true
+        }, { h: href, t: title })
+
+        if (domResult) {
+            this.logger.debug('SECTION', `S4 DOM evaluate click: "${title}"`)
+            return true
+        }
+
+        // ── S5: Keyboard TAB + Enter ───────────────────────────────────────
+        return await this.clickViaKeyboard(page, href, title)
+    }
+
+    private async clickViaKeyboard(page: Page, href: string, title: string): Promise<boolean> {
+        this.logger.debug('SECTION', `S5 keyboard TAB for "${title}"`)
+        await page.evaluate(() => document.body.focus())
+
+        for (let i = 0; i < 80; i++) {
+            await page.keyboard.press('Tab')
+            await new Promise(r => setTimeout(r, 55))
+
+            const match = await page.evaluate(({ h, t }) => {
+                const el = document.activeElement as HTMLAnchorElement | null
+                if (!el) return false
+                const elHref = el.href ?? ''
+                const elText = (el.textContent ?? el.getAttribute('aria-label') ?? '').toLowerCase()
+                return elHref === h || elHref.includes(h) || elText.includes(t.toLowerCase())
+            }, { h: href, t: title })
+
+            if (match) {
+                this.logger.debug('SECTION', `S5 found target at TAB ${i + 1}, pressing Enter`)
+                await page.keyboard.press('Enter')
+                return true
+            }
+        }
+
+        this.logger.warn('SECTION', `S5 TAB exhausted for "${title}"`)
+        return false
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // POST-CLICK HANDLER
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private async handlePostClick(page: Page, newPagePromise: Promise<any>, task: TaskInfo): Promise<void> {
+        const newPage = await newPagePromise
+
+        if (newPage) {
+            this.logger.debug('SECTION', `New tab for "${task.title}"`)
+            await newPage.waitForLoadState('domcontentloaded').catch(() => { })
+            await new Promise(r => setTimeout(r, 4000))
+            await newPage.close().catch(() => { })
         } else {
-            this.logger.debug('SECTION', `Section already expanded: ${sectionKey}`)
+            const currentUrl = page.url()
+            const onRewards =
+                currentUrl.includes('rewards.bing.com') ||
+                currentUrl.includes('/earn') ||
+                currentUrl.includes('/dashboard')
+
+            if (!onRewards) {
+                this.logger.debug('SECTION', `Same-tab nav to ${currentUrl}, going back`)
+                await page.goBack({ timeout: 8000 }).catch(() =>
+                    page.goto('https://rewards.bing.com/', { waitUntil: 'domcontentloaded' })
+                )
+                await new Promise(r => setTimeout(r, 2000))
+            } else {
+                await new Promise(r => setTimeout(r, 2500))
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // SECTION EXPAND — 5-strategy cascade
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private async expandSection(page: Page, sectionKey: string, uiContext: UIContext): Promise<boolean> {
+        const sectionName = sectionKey.replace('_container', '').replace(/_/g, ' ')
+
+        // ── S1: Direct CSS click on collapsed trigger ──────────────────────
+        try {
+            const btn = await page.$(
+                `button[slot="trigger"][aria-label*="${sectionName}" i][aria-expanded="false"]`
+            )
+            if (btn) {
+                this.logger.info('SECTION', `Expand S1 "${sectionName}" via direct CSS`)
+                await btn.scrollIntoViewIfNeeded().catch(() => { })
+                await btn.click({ force: true })
+                await new Promise(r => setTimeout(r, 2000))
+                if (await btn.getAttribute('aria-expanded').catch(() => null) === 'true') return true
+            }
+        } catch { /* next */ }
+
+        // ── S2: Already open? ──────────────────────────────────────────────
+        const alreadyOpen = await page.evaluate((name) => {
+            return Array.from(
+                document.querySelectorAll<HTMLButtonElement>('button[slot="trigger"][aria-expanded="true"]')
+            ).some(b =>
+                (b.getAttribute('aria-label') ?? '').toLowerCase().includes(name.toLowerCase())
+            )
+        }, sectionName).catch(() => false)
+
+        if (alreadyOpen) {
+            this.logger.debug('SECTION', `"${sectionName}" already expanded`)
             return false
         }
+
+        // ── S3: Locator filter ─────────────────────────────────────────────
+        try {
+            const loc = page.locator('button[slot="trigger"]')
+                .filter({ hasText: new RegExp(sectionName, 'i') })
+            if (await loc.count() > 0) {
+                const exp = await loc.first().getAttribute('aria-expanded')
+                if (exp === 'false') {
+                    this.logger.info('SECTION', `Expand S3 "${sectionName}" via locator filter`)
+                    await loc.first().scrollIntoViewIfNeeded().catch(() => { })
+                    await loc.first().click({ force: true })
+                    await new Promise(r => setTimeout(r, 2000))
+                    return true
+                }
+                if (exp === 'true') return false
+            }
+        } catch { /* next */ }
+
+        // ── S4: SelectorResolver + evaluateHandle ─────────────────────────
+        const titleEl = await this.selectorResolver.resolveElement(page, sectionKey, uiContext, 1500)
+        if (titleEl) {
+            const triggerBtn = await titleEl.evaluateHandle((node) => {
+                const container = (node as Element).closest(
+                    '.react-aria-Disclosure, section, [class*="Disclosure"]'
+                )
+                return container?.querySelector<HTMLButtonElement>(
+                    'button[slot="trigger"][aria-expanded="false"], button[aria-expanded="false"]'
+                ) ?? null
+            }).then(h => h.asElement())
+
+            if (triggerBtn) {
+                this.logger.info('SECTION', `Expand S4 "${sectionName}" via resolver`)
+                await triggerBtn.scrollIntoViewIfNeeded().catch(() => { })
+                await triggerBtn.click({ force: true }).catch(() => { })
+                await new Promise(r => setTimeout(r, 2000))
+                return true
+            }
+        }
+
+        // ── S5: TAB keyboard navigation ────────────────────────────────────
+        return await this.expandViaTAB(page, sectionName)
+    }
+
+    private async expandViaTAB(page: Page, sectionName: string): Promise<boolean> {
+        this.logger.info('SECTION', `Expand S5 TAB nav for "${sectionName}"`)
+        await page.evaluate(() => document.body.focus())
+
+        for (let i = 0; i < 60; i++) {
+            await page.keyboard.press('Tab')
+            await new Promise(r => setTimeout(r, 70))
+
+            const focus = await page.evaluate(() => ({
+                ariaLabel: document.activeElement?.getAttribute('aria-label') ?? '',
+                ariaExpanded: document.activeElement?.getAttribute('aria-expanded') ?? '',
+                slot: document.activeElement?.getAttribute('slot') ?? '',
+            }))
+
+            if (
+                focus.ariaExpanded === 'false' &&
+                focus.slot === 'trigger' &&
+                focus.ariaLabel.toLowerCase().includes(sectionName.toLowerCase())
+            ) {
+                this.logger.info('SECTION', `TAB found "${sectionName}" at press ${i + 1}, pressing Enter`)
+                await page.keyboard.press('Enter')
+                await new Promise(r => setTimeout(r, 2500))
+                return true
+            }
+        }
+
+        this.logger.warn('SECTION', `TAB failed for "${sectionName}"`)
+        return false
     }
 }

@@ -16,164 +16,191 @@ export class UIScanner {
         this.sectionHandler = new SectionHandler(logger, selectorResolver, uiService)
     }
 
-    /**
-     * Discover available tasks on the current page
-     */
+    // ══════════════════════════════════════════════════════════════════════════
+    // DISCOVER TASKS
+    // ══════════════════════════════════════════════════════════════════════════
+
     async discoverTasks(page: Page, uiContext: UIContext): Promise<DiscoveredTask[]> {
-        this.logger.info('SCANNER', 'Scanning page for available rewards activities...')
+        this.logger.info('SCANNER', 'Scanning page for reward activities...')
 
-        // Ensure all content is loaded by scrolling
-        this.logger.debug('SCANNER', 'Scrolling page to trigger lazy loading...')
-        await page.evaluate(async () => {
-            const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+        // Scroll to trigger lazy loading
+        await this.scrollPage(page)
 
-            // Scroll down in chunks to reveal "Keep Earning" section and trigger lazy loading
-            for (let i = 0; i < 4; i++) {
-                window.scrollBy(0, 1000);
-                await delay(800);
-
-                // If we've scrolled deep and see the footer, we can stop
-                if (document.body.innerText.includes('Microsoft Rewards support')) {
-                    break;
-                }
-            }
-        })
-        await page.waitForTimeout(1000)
-
-        // Ensure sections are expanded (Daily Set, Keep Earning)
+        // Expand all sections
         await this.ensureSectionsExpanded(page, uiContext)
-
-        // Wait for newly revealed content to load
         await page.waitForTimeout(2000)
 
-        // Second scroll pass REGARDLESS of expansion to trigger lazy loading of cards
-        this.logger.debug('SCANNER', 'Performing final scroll pass for lazy-loaded cards...')
-        try {
-            await page.evaluate(async () => {
-                const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
-                for (let i = 0; i < 3; i++) {
-                    window.scrollBy(0, 800)
-                    await delay(800)
-                }
-            })
-        } catch (e) {
-            this.logger.warn('SCANNER', 'Final scroll pass failed (non-critical)', { error: e instanceof Error ? e.message : String(e) })
-        }
+        // Second scroll pass after expansion
+        await this.scrollPage(page)
 
-        // 1. Find all activity cards
-        const cards = await this.selectorResolver.resolveElements(page, 'activity_card', uiContext)
-        this.logger.debug('SCANNER', `Found ${cards.length} potential activity cards`)
+        // Collect all card-like anchor elements
+        const cards = await this.collectCards(page, uiContext)
+        this.logger.debug('SCANNER', `Found ${cards.length} candidate card elements`)
 
         const discoveredTasks: DiscoveredTask[] = []
 
-        // 2. Analyze each card with internal retry logic for lazy-loaded items
         for (const card of cards) {
             try {
-                // Stronger validation: ensure card is not a "ghost" element
                 const box = await card.boundingBox()
                 if (!box || box.width === 0 || box.height === 0) continue
 
                 const task = await this.analyzeCard(page, card)
                 if (task) {
-                    this.logger.debug('SCANNER', `Analyzed: ${task.title} (${task.points} pts) - Y: ${Math.round(task.y)} - Complete: ${task.isComplete}`)
+                    this.logger.debug('SCANNER',
+                        `  Task: "${task.title}" (${task.points}pts) complete=${task.isComplete}`
+                    )
                     discoveredTasks.push(task)
                 }
             } catch (error) {
-                this.logger.warn('SCANNER', 'Failed to analyze an activity card (skipping)', { error: error instanceof Error ? error.message : String(error) })
+                this.logger.warn('SCANNER', `Card analysis failed: ${error instanceof Error ? error.message : String(error)}`)
             }
         }
 
-
-        this.logger.info('SCANNER', `Discovery complete. Found ${discoveredTasks.length} activities (${discoveredTasks.filter(t => !t.isComplete).length} incomplete)`)
-
-        // Log each discovered task for debugging
-        if (discoveredTasks.length > 0) {
-            this.logger.debug('SCANNER', 'Discovered tasks:')
-            discoveredTasks.forEach((t, idx) => {
-                this.logger.debug('SCANNER', `  ${idx + 1}. ${t.title} - ${t.points}pts - Complete: ${t.isComplete}`)
-            })
-        }
+        this.logger.info('SCANNER',
+            `Discovery: ${discoveredTasks.length} tasks (${discoveredTasks.filter(t => !t.isComplete).length} incomplete)`
+        )
 
         return discoveredTasks
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // INTERNAL HELPERS
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private async scrollPage(page: Page): Promise<void> {
+        try {
+            await page.evaluate(async () => {
+                const delay = (ms: number) => new Promise(r => setTimeout(r, ms))
+                for (let i = 0; i < 4; i++) {
+                    window.scrollBy(0, 900)
+                    await delay(700)
+                    if (document.body.innerText.includes('Microsoft Rewards support')) break
+                }
+            })
+            await page.waitForTimeout(800)
+        } catch { /* non-critical */ }
+    }
+
     /**
-     * Extract metadata from an activity card element
+     * Collect card elements using multiple selector strategies.
+     * Returns the best-matching set of ElementHandles.
+     */
+    private async collectCards(page: Page, uiContext: UIContext): Promise<ElementHandle[]> {
+        // Try SelectorResolver bank first
+        const bankCards = await this.selectorResolver.resolveElements(page, 'activity_card', uiContext)
+        if (bankCards.length > 0) return bankCards
+
+        // Fallback: try known 2025 UI selectors in order of specificity
+        const fallbackSelectors = [
+            'a[data-react-aria-pressable="true"]',
+            'a[href][class*="card"]',
+            'a[href][class*="offer"]',
+            'a[href*="rewards.bing.com"]',
+            'a[href*="bing.com"]',
+            '[data-bi-id] a[href]',
+        ]
+
+        for (const sel of fallbackSelectors) {
+            const els = await page.$$(sel)
+            if (els.length > 0) {
+                this.logger.debug('SCANNER', `Cards found via fallback selector: ${sel} (${els.length})`)
+                return els
+            }
+        }
+
+        return []
+    }
+
+    /**
+     * Extract structured task data from a card ElementHandle.
      */
     private async analyzeCard(page: Page, card: ElementHandle): Promise<DiscoveredTask | null> {
-        // Extract title and points using a more robust evaluation script for the 2025 UI
-        const metadata = await card.evaluate((el: any) => {
-            const text = el.textContent || ''
+        const metadata = await card.evaluate((el: HTMLElement) => {
+            const text = el.textContent ?? ''
+            const textLower = text.toLowerCase()
 
-            // Try to find a specific points element first (preferred in 2025 UI)
-            const pointsEl = el.querySelector('.text-title1, .pointsValue, [class*="points"]')
+            // ── Title extraction (priority order) ──────────────────────────
+            const titleEl =
+                el.querySelector('.text-body1Strong') ??
+                el.querySelector('p.line-clamp-3') ??
+                el.querySelector('[class*="title"]') ??
+                el.querySelector('p') ??
+                el.querySelector('h2, h3, h4')
+
+            const title = (titleEl?.textContent ?? text.split('+')[0] ?? '').trim().substring(0, 80)
+
+            // ── Points extraction ───────────────────────────────────────────
             let points = 0
+            const pointsEl =
+                el.querySelector('p.text-caption1Stronger') ??
+                el.querySelector('.text-title1') ??
+                el.querySelector('.pointsValue') ??
+                el.querySelector('[class*="points"]')
+
             if (pointsEl) {
-                points = parseInt(pointsEl.textContent?.replace(/[^0-9]/g, '') || '0')
+                const m = (pointsEl.textContent ?? '').match(/\+?(\d+)/)
+                if (m) points = parseInt(m[1])
             }
 
-            if (!points || points < 5) {
-                // Fallback to regex: look for + followed by digits with word boundary to avoid matching "1 day"
-                const pointMatches = text.match(/\+(\d+)\b/g)
-                if (pointMatches) {
-                    const nums = pointMatches.map((m: string) => parseInt(m.replace(/\+/g, '')))
-                    // Sum bonus + base or take max
-                    points = nums.reduce((a: number, b: number) => a + b, 0)
+            // Fallback regex on full text
+            if (!points) {
+                const allMatches = Array.from(text.matchAll(/\+(\d+)/g))
+                if (allMatches.length > 0) {
+                    points = allMatches.reduce((sum, m) => sum + parseInt(m[1]), 0)
                 }
             }
 
-            // Extract title: look for heading or first non-point-like text
-            const nodes = Array.from(el.querySelectorAll('p, span, h2, h3'))
-                .map((n: any) => n.textContent?.trim())
-                .filter(t => t && !t.startsWith('+') && !/^\d+$/.test(t) && t.length > 3)
+            // ── Completion detection ────────────────────────────────────────
+            const hasGreenBadge  = el.querySelector('.bg-statusSuccessBg3') !== null
+            const hasCheckmark   = el.querySelector('[class*="checkmark"]') !== null ||
+                                   el.querySelector('[class*="complete"]') !== null ||
+                                   el.querySelector('[aria-label*="Complete" i]') !== null
+            const hasCompletedTx = textLower.includes('completed')
+            const isCompleted    = (hasGreenBadge || hasCheckmark) && hasCompletedTx
 
-            const title = nodes[0] || text.split('+')[0]?.trim() || 'Unknown Task'
+            // ── URL extraction ──────────────────────────────────────────────
+            const anchor = el.tagName === 'A' ? el as HTMLAnchorElement : el.querySelector<HTMLAnchorElement>('a')
+            const href = anchor?.href ?? ''
 
-            return { title, points }
+            return { title, points, isCompleted, href }
         })
 
-        const title = metadata.title
-        const points = metadata.points
+        const { title, points, isCompleted, href } = metadata
 
-        // Filtering: If no points and generic title, it's likely not a reward task
-        const isGeneric = ['available points', 'points', 'level', 'status', 'bing', 'edge', 'mobile'].some(word => title.toLowerCase().includes(word))
-        if (points === 0 && isGeneric) {
-            return null
-        }
+        if (!title || title.length < 2) return null
 
-        // Check completion status robustly
-        const isComplete = await card.$('.brandStrokeCompound, [class*="Complete"], [aria-label*="Complete"]').then(el => el !== null).catch(() => false)
+        // Filter out noise items
+        const isNoise = points === 0 && ['available points', 'points', 'level', 'status'].some(
+            w => title.toLowerCase().includes(w)
+        )
+        if (isNoise) return null
 
-        // Check lock status
-        const isLocked = await card.$('.mee-icon-Lock, [class*="Lock"], [disabled]').then(el => el !== null).catch(() => false)
+        // Completion + lock status via separate $() calls
+        const isLocked = await card.$('.mee-icon-Lock, [class*="Lock"], [disabled]')
+            .then(el => el !== null)
+            .catch(() => false)
 
-        // Extract destination URL if available
-        const destinationUrl = await card.$eval('a', (el: any) => el.href).catch(() => undefined)
-
-        // Get vertical position for sorting
         const boundingBox = await card.boundingBox()
-        const y = boundingBox ? boundingBox.y + (await page.evaluate(() => window.scrollY)) : 0
+        const y = boundingBox
+            ? boundingBox.y + await page.evaluate(() => window.scrollY)
+            : 0
 
-        // ID generation based on title and points
         const id = Buffer.from(`${title}-${points}`).toString('base64').substring(0, 16)
 
         return {
             id,
             title,
             points,
-            isComplete,
+            isComplete: isCompleted,
             isLocked,
-            typeHints: this.generateTypeHints(title, destinationUrl),
+            typeHints: this.generateTypeHints(title, href),
             actionTarget: card,
-            destinationUrl,
+            destinationUrl: href || undefined,
             containerElement: card,
             y
         }
     }
 
-    /**
-     * Generate activity type hints based on title and URL
-     */
     private generateTypeHints(title: string, url?: string): string[] {
         const hints: string[] = []
         const lowerTitle = title.toLowerCase()
@@ -187,15 +214,7 @@ export class UIScanner {
         return hints
     }
 
-    /**
-     * Ensure sections are expanded (Daily Set, Keep Earning)
-     */
-    /**
-     * Ensure all rewards sections are expanded.
-     * Returns true if any section was newly expanded.
-     */
     async ensureSectionsExpanded(page: Page, uiContext: UIContext): Promise<boolean> {
-        this.logger.debug('SCANNER', 'Ensuring sections are expanded...')
-        return await this.sectionHandler.expandAllSections(page, uiContext)
+        return this.sectionHandler.expandAllSections(page, uiContext)
     }
 }

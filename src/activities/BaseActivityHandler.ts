@@ -1,4 +1,4 @@
-import type { Page } from 'patchright'
+import type { Page, ElementHandle } from 'patchright'
 import { Logger } from '../logging/Logger'
 import { SelectorResolver } from '../selectors/SelectorResolver'
 import type { DiscoveredTask, UIContext, TaskType } from '../types'
@@ -14,81 +14,140 @@ export abstract class BaseActivityHandler {
 
     abstract getType(): TaskType
 
-    /**
-     * Handle the execution of a specific activity
-     */
     abstract handle(page: Page, task: DiscoveredTask, uiContext: UIContext): Promise<boolean>
 
     /**
-     * Basic "click and wait" behavior for simple URL rewards
+     * Click a task card and wait for the resulting page/tab.
+     *
+     * Strategy cascade:
+     *  1. Playwright .click() directly on the actionTarget ElementHandle
+     *  2. page.locator by destinationUrl href
+     *  3. page.locator filter by task title text
+     *  4. DOM evaluate + MouseEvent dispatch (bypasses pointer-events:none / React wrappers)
      */
     protected async clickAndWait(page: Page, task: DiscoveredTask): Promise<boolean> {
-        this.logger.info('ACTIVITY', `Executing keyboard click (TAB + ENTER) for: ${task.title}`)
+        this.logger.info('ACTIVITY', `Clicking task: "${task.title}"`)
 
-        try {
-            // Scroll the task card into view
-            await task.actionTarget.scrollIntoViewIfNeeded().catch(() => { })
-            await new Promise(r => setTimeout(r, 500))
+        // Set up new-tab listener before any click
+        const newPagePromise = page.context()
+            .waitForEvent('page', { timeout: 12000 })
+            .catch(() => null)
 
-            // Focus on page body first
-            await page.evaluate(() => {
-                document.body.focus()
-            })
-
-            // Press TAB a few times to focus on the task card
-            // User reports needing 1-3 TABs per task
-            let taskFocused = false
-            for (let i = 0; i < 5; i++) {
-                await page.keyboard.press('Tab')
-                await new Promise(r => setTimeout(r, 150))
-
-                // Check if we've focused an interactive element within the task
-                const currentFocus = await page.evaluate(() => {
-                    const el = document.activeElement
-                    return {
-                        tag: el?.tagName,
-                        href: (el as HTMLAnchorElement)?.href,
-                        role: el?.getAttribute('role')
-                    }
-                })
-
-                // If we've focused a link or button, we're ready
-                if (currentFocus.tag === 'A' || currentFocus.tag === 'BUTTON' || currentFocus.role === 'button') {
-                    taskFocused = true
-                    this.logger.debug('ACTIVITY', `Task focused after ${i + 1} TABs`)
-                    break
-                }
-            }
-
-            if (!taskFocused) {
-                this.logger.warn('ACTIVITY', `Could not focus on task: ${task.title}`)
-                return false
-            }
-
-            // Press ENTER to activate the task
-            this.logger.debug('ACTIVITY', `Pressing ENTER to activate: ${task.title}`)
-
-            const [newPage] = await Promise.all([
-                page.context().waitForEvent('page', { timeout: 15000 }).catch(() => null),
-                page.keyboard.press('Enter')
-            ])
-
-            if (newPage) {
-                this.logger.debug('ACTIVITY', `New page opened for ${task.title}, waiting for load...`)
-                await newPage.waitForLoadState('domcontentloaded').catch(() => { })
-                await new Promise(r => setTimeout(r, 4000)) // Stay on page for 4 seconds
-                await newPage.close().catch(() => { })
-                return true
-            } else {
-                this.logger.warn('ACTIVITY', `No new page opened for ${task.title} after ENTER. It might be a background task or failure.`)
-                // Some tasks don't open a new page but still register (like polls sometimes)
-                // We'll return true if we pressed ENTER, but wait a bit
-                await new Promise(r => setTimeout(r, 3000))
-                return true
-            }
-        } catch (error) {
-            this.logger.error('ACTIVITY', `Failed to execute keyboard click: ${task.title}`, { error: error instanceof Error ? error.message : String(error) })
+        const clicked = await this.tryClick(page, task)
+        if (!clicked) {
+            this.logger.warn('ACTIVITY', `All click strategies failed for: "${task.title}"`)
             return false
         }
+
+        // Handle result
+        const newPage = await newPagePromise
+
+        if (newPage) {
+            this.logger.debug('ACTIVITY', `New tab opened for "${task.title}"`)
+            await newPage.waitForLoadState('domcontentloaded').catch(() => { })
+            await new Promise(r => setTimeout(r, 4000))
+            await newPage.close().catch(() => { })
+            return true
+        }
+
+        // Same-tab: check if we navigated away
+        const currentUrl = page.url()
+        const onRewards =
+            currentUrl.includes('rewards.bing.com') ||
+            currentUrl.includes('/earn') ||
+            currentUrl.includes('/dashboard')
+
+        if (!onRewards) {
+            this.logger.debug('ACTIVITY', `Same-tab nav to ${currentUrl}, going back`)
+            await page.goBack({ timeout: 8000 }).catch(() =>
+                page.goto('https://rewards.bing.com/', { waitUntil: 'domcontentloaded' })
+            )
+            await new Promise(r => setTimeout(r, 2000))
+        } else {
+            await new Promise(r => setTimeout(r, 3000))
+        }
+
+        return true
+    }
+
+    private async tryClick(page: Page, task: DiscoveredTask): Promise<boolean> {
+        // ── S1: Direct click on the ElementHandle ─────────────────────────
+        if (task.actionTarget) {
+            try {
+                const el: ElementHandle = task.actionTarget
+                const box = await el.boundingBox()
+                if (box && box.width > 0 && box.height > 0) {
+                    const isVisible = await el.isVisible().catch(() => false)
+                    if (isVisible) {
+                        await el.scrollIntoViewIfNeeded().catch(() => { })
+                        await el.click({ force: true, timeout: 5000 })
+                        this.logger.debug('ACTIVITY', `S1 direct element click: "${task.title}"`)
+                        return true
+                    }
+                }
+            } catch (e) {
+                this.logger.debug('ACTIVITY', `S1 failed: ${e instanceof Error ? e.message : String(e)}`)
+            }
+        }
+
+        // ── S2: Locator by destination URL ────────────────────────────────
+        if (task.destinationUrl) {
+            for (const hrefVal of [task.destinationUrl]) {
+                try {
+                    const loc = page.locator(`a[href="${hrefVal}"]`).first()
+                    if (await loc.count() > 0 && await loc.isVisible().catch(() => false)) {
+                        await loc.scrollIntoViewIfNeeded().catch(() => { })
+                        await loc.click({ force: true, timeout: 5000 })
+                        this.logger.debug('ACTIVITY', `S2 href click: "${task.title}"`)
+                        return true
+                    }
+                } catch { /* next */ }
+            }
+        }
+
+        // ── S3: Locator filter by title text ──────────────────────────────
+        try {
+            const loc = page.locator('a[href], [role="button"]')
+                .filter({ hasText: task.title })
+                .first()
+            if (await loc.count() > 0 && await loc.isVisible().catch(() => false)) {
+                await loc.scrollIntoViewIfNeeded().catch(() => { })
+                await loc.click({ force: true, timeout: 5000 })
+                this.logger.debug('ACTIVITY', `S3 text filter click: "${task.title}"`)
+                return true
+            }
+        } catch { /* next */ }
+
+        // ── S4: DOM evaluate + MouseEvent dispatch ─────────────────────────
+        const domResult = await page.evaluate(({ href, title }) => {
+            let el: HTMLElement | null = href
+                ? document.querySelector<HTMLAnchorElement>(`a[href="${href}"]`)
+                : null
+
+            if (!el) {
+                el = Array.from(document.querySelectorAll<HTMLElement>('a[href], [role="button"]'))
+                    .find(e =>
+                        (e.textContent ?? '').trim().toLowerCase().includes(title.toLowerCase()) ||
+                        (e.getAttribute('aria-label') ?? '').toLowerCase().includes(title.toLowerCase())
+                    ) ?? null
+            }
+
+            if (!el) return false
+
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+            for (const t of ['mouseenter', 'mouseover', 'mousedown', 'mouseup']) {
+                el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true }))
+            }
+            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }))
+            el.click()
+            return true
+        }, { href: task.destinationUrl ?? '', title: task.title })
+
+        if (domResult) {
+            this.logger.debug('ACTIVITY', `S4 DOM click: "${task.title}"`)
+            return true
+        }
+
+        return false
     }
 }
